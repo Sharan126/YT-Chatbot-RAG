@@ -1,5 +1,8 @@
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
+import json
+import urllib.request
+import yt_dlp
 import faiss
 import numpy as np
 from groq import Groq
@@ -49,42 +52,65 @@ def extract_video_id(url):
             return match.group(1)
     return None 
 
-# 2. Fetching Video Transcripts  
+# 2. Fetching Video Transcripts (Dual-Engine: youtube-transcript-api + yt-dlp fallback)
 def get_transcript(video_id):
     if not video_id:
         return None
+
+    # Method 1: Try youtube_transcript_api
     try:
         ytt_api = YouTubeTranscriptApi()
-        # Try direct fetch for English first
         try:
             transcript_data = ytt_api.fetch(video_id, languages=["en"])
             full_text = " ".join(item["text"] if isinstance(item, dict) else item.text for item in transcript_data)
-            return re.sub(r"\s+", " ", full_text)
+            if full_text and len(full_text.strip()) > 10:
+                return re.sub(r"\s+", " ", full_text)
         except Exception:
             pass
 
-        # Try listing all available transcripts for the video (any language / auto-generated)
         transcript_list = ytt_api.list(video_id)
-        
         target_transcript = None
         for t in transcript_list:
             if not getattr(t, 'is_generated', True):
                 target_transcript = t
                 break
-        
         if not target_transcript:
             target_transcript = next(iter(transcript_list))
-            
+
         transcript_data = target_transcript.fetch()
         full_text = " ".join(item["text"] if isinstance(item, dict) else item.text for item in transcript_data)
-        return re.sub(r"\s+", " ", full_text)
-        
+        if full_text and len(full_text.strip()) > 10:
+            return re.sub(r"\s+", " ", full_text)
     except Exception as e:
-        try:
-            print(f"Transcript error for video '{video_id}': {e}")
-        except Exception:
-            pass
-        return None    
+        print(f"youtube_transcript_api failed for video '{video_id}': {e}")
+
+    # Method 2: Fallback to yt-dlp (Bypasses Cloud Datacenter IP blocking on Render)
+    try:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        ydl_opts = {
+            'skip_download': True,
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+            'quiet': True,
+            'no_warnings': True
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            subs = info.get('subtitles') or info.get('automatic_captions')
+            if subs:
+                lang = 'en' if 'en' in subs else next(iter(subs))
+                formats = subs[lang]
+                fmt = next((f for f in formats if f.get('ext') == 'json3'), formats[0])
+                res = urllib.request.urlopen(fmt['url']).read().decode('utf-8')
+                data = json.loads(res)
+                lines = [ ''.join(s.get('utf8', '') for s in e.get('segs', [])).strip() for e in data.get('events', []) if 'segs' in e ]
+                full_text = " ".join(l for l in lines if l)
+                if full_text and len(full_text.strip()) > 10:
+                    return re.sub(r"\s+", " ", full_text)
+    except Exception as e:
+        print(f"yt-dlp fallback failed for video '{video_id}': {e}")
+
+    return None    
         
 # 3. Splitting transcript into chunks
 def split_text(text,chunk_size=150):
