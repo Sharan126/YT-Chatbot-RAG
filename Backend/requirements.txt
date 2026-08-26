@@ -8,4 +8,5 @@ python-dotenv
 pydantic
 groq
 sentence-transformers
-yt-dlp
+yt-dlp
+curl_cffi

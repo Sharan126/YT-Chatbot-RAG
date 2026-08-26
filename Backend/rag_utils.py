@@ -168,17 +168,61 @@ def probe_video_accessibility(video_id: str) -> tuple[str | None, str | None]:
         
     return None, None
 
+import http.cookiejar
+
+def get_youtube_cookie_path() -> str | None:
+    """
+    Locate cookies.txt file if available from environment variable or standard relative paths.
+    Returns absolute path string if found, otherwise None.
+    """
+    env_path = os.getenv("YOUTUBE_COOKIES_PATH")
+    if env_path:
+        abs_env = os.path.abspath(env_path)
+        if os.path.exists(abs_env):
+            return abs_env
+        else:
+            logger.warning(f"YOUTUBE_COOKIES_PATH set to '{env_path}' but file does not exist.")
+
+    candidates = [
+        "Backend/cookies.txt",
+        "cookies.txt",
+        os.path.join(os.path.dirname(__file__), "cookies.txt"),
+        os.path.join(os.path.dirname(__file__), "..", "Backend", "cookies.txt")
+    ]
+    for c in candidates:
+        abs_c = os.path.abspath(c)
+        if os.path.exists(abs_c):
+            return abs_c
+    return None
+
+def load_cookiejar(cookie_path: str | None) -> http.cookiejar.MozillaCookieJar | None:
+    """
+    Safely parse and return MozillaCookieJar from cookie_path.
+    Returns None if missing or invalid.
+    """
+    if not cookie_path or not os.path.exists(cookie_path):
+        return None
+    try:
+        cj = http.cookiejar.MozillaCookieJar(cookie_path)
+        cj.load(ignore_discard=True, ignore_expires=True)
+        logger.info(f"Successfully loaded YouTube cookies from '{cookie_path}'")
+        return cj
+    except Exception as e:
+        logger.warning(f"Failed to load cookies from '{cookie_path}': {e}")
+        return None
+
 # 2. Fetching Video Transcripts with Multi-Strategy Fallback & Categorized Logging
 def get_transcript_details(video_id: str, max_retries: int = 2) -> tuple[str | None, str, str | None]:
     """
     Extract transcript for video_id using sequential pipeline:
     1. Validate URL / Video ID -> INVALID_URL
     2. Innertube Pre-Check Probe -> VIDEO_UNAVAILABLE or YOUTUBE_BLOCKED
-    3. Primary Method: youtube_transcript_api (manual/auto captions with multi-lang fallback & translation)
+    3. Primary Method: youtube_transcript_api (manual/auto captions with multi-lang fallback & translation & cookies)
     4. Direct Innertube player API captionTracks TimedText download
-    5. yt-dlp Engine #1: In-Memory Subtitle Extraction (with Node.js JS runtime & curl_cffi)
+    5. yt-dlp Engine #1: In-Memory Subtitle Extraction (with Node.js JS runtime & cookies.txt & curl_cffi)
     6. yt-dlp Engine #2: Disk download in isolated temp directory
     7. Strategy 5: Watch Page HTML Scraper (ytInitialPlayerResponse parsing)
+    8. Strategy 6: Groq Whisper AI Audio Transcription Fallback
 
     Returns tuple: (transcript_text, status_category, user_error_message)
     """
@@ -198,13 +242,27 @@ def get_transcript_details(video_id: str, max_retries: int = 2) -> tuple[str | N
     last_error_category = probe_cat
     last_user_error = probe_err
 
+    # Check for cookies.txt file
+    cookie_path = get_youtube_cookie_path()
+    if cookie_path:
+        logger.info(f"Using YouTube cookie file: '{cookie_path}'")
+
     # Try creating curl_cffi session for anti-bot TLS impersonation if installed
-    curl_session = None
+    http_session = None
     try:
         from curl_cffi import requests as curl_requests
-        curl_session = curl_requests.Session(impersonate="chrome124")
+        http_session = curl_requests.Session(impersonate="chrome124")
     except Exception:
-        curl_session = None
+        import requests
+        http_session = requests.Session()
+
+    if cookie_path and http_session:
+        cj = load_cookiejar(cookie_path)
+        if cj:
+            try:
+                http_session.cookies.update(cj)
+            except Exception as e:
+                logger.warning(f"Could not attach cookiejar to http_session: {e}")
 
     preferred_langs = ['en', 'en-US', 'en-GB', 'en-CA', 'en-IN', 'en-AU']
 
@@ -212,7 +270,7 @@ def get_transcript_details(video_id: str, max_retries: int = 2) -> tuple[str | N
     for attempt in range(max_retries):
         try:
             logger.info(f"[{video_id}] Strategy 1: Attempting youtube_transcript_api (attempt {attempt + 1})...")
-            ytt = YouTubeTranscriptApi(http_client=curl_session) if curl_session else YouTubeTranscriptApi()
+            ytt = YouTubeTranscriptApi(http_client=http_session)  # type: ignore
             
             # Stage 1A: Preferred languages direct fetch
             try:
@@ -359,9 +417,9 @@ def get_transcript_details(video_id: str, max_retries: int = 2) -> tuple[str | N
                         if track_url:
                             # Try fetching track URL
                             t_payload = None
-                            if curl_session:
+                            if http_session:
                                 try:
-                                    res = curl_session.get(track_url)
+                                    res = http_session.get(track_url)
                                     if res.status_code == 200:
                                         t_payload = res.text
                                 except Exception:
@@ -400,23 +458,25 @@ def get_transcript_details(video_id: str, max_retries: int = 2) -> tuple[str | N
                     'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                     'js_runtimes': {'node': {}}
                 }
+                if cookie_path:
+                    ydl_opts['cookiefile'] = cookie_path
                 if client_setting:
                     ydl_opts['extractor_args'] = {'youtube': {'player_client': client_setting}}
 
                 url = f"https://www.youtube.com/watch?v={video_id}"
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
                     info = ydl.extract_info(url, download=False)
-                    subs = info.get('subtitles') or info.get('automatic_captions')
-                    if subs:
+                    subs = (info.get('subtitles') or info.get('automatic_captions')) if isinstance(info, dict) else None
+                    if subs and isinstance(subs, dict):
                         lang = next((l for l in preferred_langs if l in subs), next(iter(subs.keys())))
                         formats = subs[lang]
-                        fmt = next((f for f in formats if f.get('ext') == 'json3'), next((f for f in formats if f.get('ext') == 'vtt'), formats[0]))
-                        sub_url = fmt.get('url')
+                        fmt = next((f for f in formats if isinstance(f, dict) and f.get('ext') == 'json3'), next((f for f in formats if isinstance(f, dict) and f.get('ext') == 'vtt'), formats[0] if formats else {}))
+                        sub_url = fmt.get('url') if isinstance(fmt, dict) else None
                         if sub_url:
                             payload = None
-                            if curl_session:
+                            if http_session:
                                 try:
-                                    res = curl_session.get(sub_url)
+                                    res = http_session.get(sub_url)
                                     if res.status_code == 200:
                                         payload = res.text
                                 except Exception:
@@ -465,6 +525,8 @@ def get_transcript_details(video_id: str, max_retries: int = 2) -> tuple[str | N
                     'socket_timeout': 10,
                     'js_runtimes': {'node': {}}
                 }
+                if cookie_path:
+                    ydl_opts['cookiefile'] = cookie_path
                 url = f"https://www.youtube.com/watch?v={video_id}"
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
                     ydl.extract_info(url, download=True)
@@ -488,9 +550,9 @@ def get_transcript_details(video_id: str, max_retries: int = 2) -> tuple[str | N
         try:
             watch_url = f"https://www.youtube.com/watch?v={video_id}"
             html_text = None
-            if curl_session:
+            if http_session:
                 try:
-                    res = curl_session.get(watch_url)
+                    res = http_session.get(watch_url)
                     if res.status_code == 200:
                         html_text = res.text
                 except Exception:
@@ -516,9 +578,9 @@ def get_transcript_details(video_id: str, max_retries: int = 2) -> tuple[str | N
                         if base_url:
                             for target_url in [base_url + '&tlang=en', base_url, base_url + '&fmt=json3']:
                                 sub_content = None
-                                if curl_session:
+                                if http_session:
                                     try:
-                                        res = curl_session.get(target_url)
+                                        res = http_session.get(target_url)
                                         if res.status_code == 200:
                                             sub_content = res.text
                                     except Exception:
@@ -551,6 +613,8 @@ def get_transcript_details(video_id: str, max_retries: int = 2) -> tuple[str | N
                     'socket_timeout': 15,
                     'js_runtimes': {'node': {}}
                 }
+                if cookie_path:
+                    ydl_opts['cookiefile'] = cookie_path
                 url = f"https://www.youtube.com/watch?v={video_id}"
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
                     ydl.download([url])
