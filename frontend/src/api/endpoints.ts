@@ -11,9 +11,7 @@ import type {
  */
 export async function processVideo(url: string): Promise<ProcessVideoResponse> {
   try {
-    const response = await apiClient.post<ProcessVideoResponse>('/process_video', null, {
-      params: { url },
-    });
+    const response = await apiClient.post<ProcessVideoResponse>('/process_video', { url });
     return response.data;
   } catch (err: unknown) {
     let errorMessage = 'Network error or backend unavailable';
@@ -24,7 +22,7 @@ export async function processVideo(url: string): Promise<ProcessVideoResponse> {
         errorMessage = err.response.data?.error || `Server responded with status ${err.response.status}`;
         traceback = err.response.data?.traceback;
       } else if (err.request) {
-        errorMessage = 'Unable to reach backend server. Check if FastAPI backend is running on port 8000.';
+        errorMessage = 'Unable to reach backend server. Please check your internet connection or backend server status.';
       } else {
         errorMessage = err.message;
       }
@@ -36,13 +34,11 @@ export async function processVideo(url: string): Promise<ProcessVideoResponse> {
 
 /**
  * Endpoint 2: Ask Question
- * POST /ask?question=...
+ * POST /ask
  */
 export async function askQuestion(question: string): Promise<AskQuestionResponse> {
   try {
-    const response = await apiClient.post<AskQuestionResponse>('/ask', null, {
-      params: { question },
-    });
+    const response = await apiClient.post<AskQuestionResponse>('/ask', { question });
     return response.data;
   } catch (err: unknown) {
     let errorMessage = 'Network error or backend unavailable';
@@ -53,7 +49,7 @@ export async function askQuestion(question: string): Promise<AskQuestionResponse
         errorMessage = err.response.data?.error || `Server error ${err.response.status}`;
         traceback = err.response.data?.traceback;
       } else if (err.request) {
-        errorMessage = 'Backend connection lost. Ensure server on port 8000 is online.';
+        errorMessage = 'Backend connection lost. Ensure backend server is online.';
       } else {
         errorMessage = err.message;
       }

@@ -5,30 +5,31 @@
 
 export function extractVideoId(url: string): string | null {
   if (!url || typeof url !== 'string') return null;
+  const trimmed = url.trim();
+
+  // 1. Raw 11-character Video ID
+  if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) {
+    return trimmed;
+  }
 
   const patterns = [
-    // Standard watch URL
-    /(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/,
-    // Shorts
-    /(?:youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
-    // Embed
-    /embed\/([a-zA-Z0-9_-]{11})/,
-    // Live
-    /live\/([a-zA-Z0-9_-]{11})/,
-    // Timecodes or query params
+    // Standard query param v=... (handles v=... at start, middle, or end of query)
     /[?&]v=([a-zA-Z0-9_-]{11})/,
+    // Shortened youtu.be/ID
+    /youtu\.be\/([a-zA-Z0-9_-]{11})/,
+    // Shorts
+    /youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})/,
+    // Embed
+    /youtube\.com\/embed\/([a-zA-Z0-9_-]{11})/,
+    // Live
+    /youtube\.com\/live\/([a-zA-Z0-9_-]{11})/,
   ];
 
   for (const pattern of patterns) {
-    const match = url.match(pattern);
+    const match = trimmed.match(pattern);
     if (match && match[1]) {
       return match[1];
     }
-  }
-
-  // If user pasted raw 11-char ID
-  if (/^[a-zA-Z0-9_-]{11}$/.test(url.trim())) {
-    return url.trim();
   }
 
   return null;

@@ -23,17 +23,25 @@ def get_embedder():
 
 # 1. Extracting youtube video ID
 def extract_video_id(url):
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip()
+    
+    # 1. Direct 11-character Video ID
+    if re.match(r'^[a-zA-Z0-9_-]{11}$', url):
+        return url
+
     patterns = [
-        # Standard 
-        r'(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})',
+        # Standard query param v=...
+        r'[?&]v=([a-zA-Z0-9_-]{11})',
+        # Shortened youtu.be/ID
+        r'youtu\.be\/([a-zA-Z0-9_-]{11})',
         # Shorts
-        r'(?:youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})',
+        r'youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})',
         # Embed
-        r'embed\/([a-zA-Z0-9_-]{11})',
+        r'youtube\.com\/embed\/([a-zA-Z0-9_-]{11})',
         # Live
-        r'live\/([a-zA-Z0-9_-]{11})',
-        # Timecodes (m=video id)
-        r'[?&]v=([a-zA-Z0-9_-]{11})&'
+        r'youtube\.com\/live\/([a-zA-Z0-9_-]{11})'
     ]
     for pattern in patterns:
         match = re.search(pattern, url)
@@ -41,21 +49,39 @@ def extract_video_id(url):
             return match.group(1)
     return None 
 
-# 2.Fetching Video Transcripts  
+# 2. Fetching Video Transcripts  
 def get_transcript(video_id):
+    if not video_id:
+        return None
     try:
         ytt_api = YouTubeTranscriptApi()
+        # Try direct fetch for English first
         try:
             transcript_data = ytt_api.fetch(video_id, languages=["en"])
+            full_text = " ".join(item["text"] if isinstance(item, dict) else item.text for item in transcript_data)
+            return re.sub(r"\s+", " ", full_text)
         except Exception:
-            transcript_list = ytt_api.list(video_id)
-            transcript_data = next(iter(transcript_list)).fetch()
+            pass
+
+        # Try listing all available transcripts for the video (any language / auto-generated)
+        transcript_list = ytt_api.list(video_id)
+        
+        target_transcript = None
+        for t in transcript_list:
+            if not getattr(t, 'is_generated', True):
+                target_transcript = t
+                break
+        
+        if not target_transcript:
+            target_transcript = next(iter(transcript_list))
+            
+        transcript_data = target_transcript.fetch()
         full_text = " ".join(item["text"] if isinstance(item, dict) else item.text for item in transcript_data)
         return re.sub(r"\s+", " ", full_text)
         
     except Exception as e:
         try:
-            print("Transcript error: ", e)
+            print(f"Transcript error for video '{video_id}': {e}")
         except Exception:
             pass
         return None    
