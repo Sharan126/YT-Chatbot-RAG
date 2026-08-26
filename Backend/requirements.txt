@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+openai
+faiss-cpu
+youtube-transcript-api
+numpy
+python-dotenv
+pydantic
+groq
+sentence-transformers
