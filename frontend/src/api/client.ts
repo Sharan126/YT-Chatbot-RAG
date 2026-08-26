@@ -16,7 +16,7 @@ const getBaseUrl = (): string => {
   }
 
   // 3. Local dev environment variable or fallback to local FastAPI server
-  return import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+  return import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:10000';
 };
 
 export const apiClient = axios.create({

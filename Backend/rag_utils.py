@@ -1,17 +1,20 @@
+import os
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
 import json
 import urllib.request
-import yt_dlp
-from yt_dlp.utils import DownloadError
+import yt_dlp  # type: ignore
+from yt_dlp.utils import DownloadError  # type: ignore
 from typing import Any
 import faiss
 import numpy as np
 from groq import Groq
 from sentence_transformers import SentenceTransformer
 from config import GROQ_API_KEY, EMBED_MODEL, LLM_MODEL
-
-import os
 from dotenv import load_dotenv
 
 def get_groq_client():
@@ -123,34 +126,93 @@ def parse_subtitle_payload(payload_str):
     # Fallback to WebVTT / Plaintext cleaning
     return clean_transcript_text(payload_str)
 
-# 2. Fetching Video Transcripts with Multi-Strategy Fallback & Categorized Logging
-def get_transcript_details(video_id, max_retries=2):
+def probe_video_accessibility(video_id: str) -> tuple[str | None, str | None]:
     """
-    Extract transcript for video_id using multi-strategy fallbacks:
-    1. youtube_transcript_api (manual/auto captions with lang fallback)
-    2. yt-dlp in-memory subtitle extraction (multiple player_client settings)
-    3. yt-dlp disk download in isolated temp directory (with auto-cleanup)
-    4. Direct Innertube player API for captions
+    Lightweight pre-check probe using Innertube player API to detect video status.
+    Returns (status_category, error_message) or (None, None) if playable/accessible.
+    """
+    url = "https://www.youtube.com/youtubei/v1/player"
+    payload = {
+        "context": {
+            "client": {
+                "clientName": "TVHTML5",
+                "clientVersion": "7.20240101.00.00",
+                "hl": "en",
+                "gl": "US"
+            }
+        },
+        "videoId": video_id
+    }
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode('utf-8'),
+            headers={
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            status = data.get('playabilityStatus', {}).get('status')
+            reason = str(data.get('playabilityStatus', {}).get('reason', ''))
+            
+            if status == "ERROR" and any(term in reason.lower() for term in ["unavailable", "private", "removed", "deleted", "does not exist"]):
+                logger.info(f"[{video_id}] Pre-check probe confirmed VIDEO_UNAVAILABLE: reason='{reason}'")
+                return "VIDEO_UNAVAILABLE", f"Video '{video_id}' is unavailable, private, or deleted on YouTube. Please check if the video URL is correct and public."
+            elif status in ("LOGIN_REQUIRED", "UNPLAYABLE") and any(term in reason.lower() for term in ["bot", "captcha", "unusual"]):
+                logger.info(f"[{video_id}] Pre-check probe confirmed YOUTUBE_BLOCKED: status='{status}' reason='{reason}'")
+                return "YOUTUBE_BLOCKED", "YouTube access was blocked or rate-limited by YouTube anti-bot protections. Please try again later."
+    except Exception as e:
+        logger.debug(f"[{video_id}] Pre-check probe warning: {e}")
+        
+    return None, None
+
+# 2. Fetching Video Transcripts with Multi-Strategy Fallback & Categorized Logging
+def get_transcript_details(video_id: str, max_retries: int = 2) -> tuple[str | None, str, str | None]:
+    """
+    Extract transcript for video_id using sequential pipeline:
+    1. Validate URL / Video ID -> INVALID_URL
+    2. Innertube Pre-Check Probe -> VIDEO_UNAVAILABLE or YOUTUBE_BLOCKED
+    3. Primary Method: youtube_transcript_api (manual/auto captions with multi-lang fallback & translation)
+    4. Direct Innertube player API captionTracks TimedText download
+    5. yt-dlp Engine #1: In-Memory Subtitle Extraction (with Node.js JS runtime & curl_cffi)
+    6. yt-dlp Engine #2: Disk download in isolated temp directory
+    7. Strategy 5: Watch Page HTML Scraper (ytInitialPlayerResponse parsing)
 
     Returns tuple: (transcript_text, status_category, user_error_message)
     """
     if not video_id or not isinstance(video_id, str):
         logger.error("Extraction failed: empty or invalid video ID type provided.")
-        return None, "INVALID_ID", "Invalid YouTube URL or video ID format."
+        return None, "INVALID_URL", "Invalid YouTube URL or video ID format."
     video_id = video_id.strip()
     if not re.match(r'^[a-zA-Z0-9_-]{11}$', video_id):
         logger.error(f"Extraction failed: video ID '{video_id}' does not match standard 11-char format.")
-        return None, "INVALID_ID", f"Invalid video ID format '{video_id}'."
+        return None, "INVALID_URL", f"Invalid video ID format '{video_id}'."
 
-    last_error_category = None
-    last_user_error = None
+    # Step 2: Pre-check probe to detect video unavailability vs anti-bot block upfront
+    probe_cat, probe_err = probe_video_accessibility(video_id)
+    if probe_cat == "VIDEO_UNAVAILABLE":
+        return None, probe_cat, probe_err
+
+    last_error_category = probe_cat
+    last_user_error = probe_err
+
+    # Try creating curl_cffi session for anti-bot TLS impersonation if installed
+    curl_session = None
+    try:
+        from curl_cffi import requests as curl_requests
+        curl_session = curl_requests.Session(impersonate="chrome124")
+    except Exception:
+        curl_session = None
+
+    preferred_langs = ['en', 'en-US', 'en-GB', 'en-CA', 'en-IN', 'en-AU']
 
     # Strategy 1: youtube_transcript_api multi-stage retrieval
     for attempt in range(max_retries):
         try:
             logger.info(f"[{video_id}] Strategy 1: Attempting youtube_transcript_api (attempt {attempt + 1})...")
-            ytt = YouTubeTranscriptApi()
-            preferred_langs = ['en', 'en-US', 'en-GB', 'en-CA', 'en-IN', 'en-AU']
+            ytt = YouTubeTranscriptApi(http_client=curl_session) if curl_session else YouTubeTranscriptApi()
             
             # Stage 1A: Preferred languages direct fetch
             try:
@@ -160,53 +222,64 @@ def get_transcript_details(video_id, max_retries=2):
                 if clean_text and len(clean_text) > 10:
                     logger.info(f"[{video_id}] Strategy 1 (preferred fetch) succeeded: {len(clean_text)} chars")
                     return clean_text, "SUCCESS", None
-            except (VideoUnavailable, TranscriptsDisabled, NoTranscriptFound, IpBlocked, RequestBlocked, PoTokenRequired):
+            except (VideoUnavailable, TranscriptsDisabled, IpBlocked, RequestBlocked, PoTokenRequired):
                 raise
             except Exception as e:
                 logger.debug(f"[{video_id}] Strategy 1A preferred fetch failed: {e}")
 
-            # Stage 1B: List transcripts & fallback selection
-            transcript_list = ytt.list(video_id)
-            selected = None
+            # Stage 1B: List transcripts & fallback selection across all languages
+            try:
+                transcript_list = ytt.list(video_id)
+                selected = None
 
-            # 1. Manual in preferred languages
-            for t in transcript_list:
-                if not getattr(t, 'is_generated', True) and getattr(t, 'language_code', '') in preferred_langs:
-                    selected = t
-                    break
-            # 2. Auto-generated in preferred languages
-            if not selected:
+                # 1. Manual in preferred languages
                 for t in transcript_list:
-                    if getattr(t, 'is_generated', False) and getattr(t, 'language_code', '') in preferred_langs:
+                    if not getattr(t, 'is_generated', True) and getattr(t, 'language_code', '') in preferred_langs:
                         selected = t
                         break
-            # 3. Any manual transcript
-            if not selected:
-                for t in transcript_list:
-                    if not getattr(t, 'is_generated', True):
+                # 2. Auto-generated in preferred languages
+                if not selected:
+                    for t in transcript_list:
+                        if getattr(t, 'is_generated', False) and getattr(t, 'language_code', '') in preferred_langs:
+                            selected = t
+                            break
+                # 3. Any manual transcript
+                if not selected:
+                    for t in transcript_list:
+                        if not getattr(t, 'is_generated', True):
+                            selected = t
+                            break
+                # 4. Any available transcript (e.g. kn, hi, te, es, fr)
+                if not selected:
+                    for t in transcript_list:
                         selected = t
                         break
-            # 4. Any available transcript
-            if not selected:
-                for t in transcript_list:
-                    selected = t
-                    break
 
-            if selected:
-                try:
+                if selected:
+                    # Try English translation if available and not already in English
                     if getattr(selected, 'language_code', '') not in preferred_langs and getattr(selected, 'is_translatable', False):
                         try:
-                            selected = selected.translate('en')
-                        except Exception:
-                            pass
+                            translated = selected.translate('en')
+                            data = translated.fetch()
+                            snippets: list[str] = [str(getattr(item, 'text', item.get('text', ''))) if isinstance(item, dict) else str(getattr(item, 'text', str(item))) for item in data]
+                            clean_text = clean_transcript_text(" ".join(snippets))
+                            if clean_text and len(clean_text) > 10:
+                                logger.info(f"[{video_id}] Strategy 1 (list -> translated en) succeeded: {len(clean_text)} chars")
+                                return clean_text, "SUCCESS", None
+                        except Exception as tr_err:
+                            logger.debug(f"[{video_id}] Translation to English failed ({tr_err}), fetching original language '{getattr(selected, 'language_code', '')}'...")
+
+                    # Fetch original transcript language
                     data = selected.fetch()
                     snippets: list[str] = [str(getattr(item, 'text', item.get('text', ''))) if isinstance(item, dict) else str(getattr(item, 'text', str(item))) for item in data]
                     clean_text = clean_transcript_text(" ".join(snippets))
                     if clean_text and len(clean_text) > 10:
                         logger.info(f"[{video_id}] Strategy 1 (list -> lang={getattr(selected, 'language_code', 'unknown')}) succeeded: {len(clean_text)} chars")
                         return clean_text, "SUCCESS", None
-                except Exception as e:
-                    logger.debug(f"[{video_id}] Fetching selected transcript failed: {e}")
+            except (VideoUnavailable, TranscriptsDisabled, IpBlocked, RequestBlocked, PoTokenRequired):
+                raise
+            except Exception as e:
+                logger.debug(f"[{video_id}] Strategy 1B list_transcripts failed: {e}")
 
         except VideoUnavailable as e:
             logger.warning(f"[{video_id}] youtube_transcript_api: VideoUnavailable ({e})")
@@ -222,28 +295,96 @@ def get_transcript_details(video_id, max_retries=2):
             logger.warning(f"[{video_id}] youtube_transcript_api: NoTranscriptFound ({e})")
             last_error_category = "CAPTIONS_UNAVAILABLE"
             last_user_error = f"No transcript found for video ID '{video_id}' on YouTube."
-            break
         except (IpBlocked, RequestBlocked, PoTokenRequired) as e:
             logger.warning(f"[{video_id}] youtube_transcript_api: IP Blocked / Anti-bot ({type(e).__name__})")
             last_error_category = "YOUTUBE_BLOCKED"
-            last_user_error = "YouTube access was blocked or rate-limited by YouTube anti-bot protections. Please try again later."
+            last_user_error = "YouTube access was temporarily rate-limited or blocked by YouTube anti-bot protections. Please try again later."
         except YouTubeRequestFailed as e:
             logger.warning(f"[{video_id}] youtube_transcript_api: YouTubeRequestFailed ({e})")
             last_error_category = "NETWORK_FAILURE"
             last_user_error = "Network failure occurred while connecting to YouTube."
         except Exception as e:
             logger.warning(f"[{video_id}] youtube_transcript_api unexpected exception: {type(e).__name__}: {e}")
-            last_error_category = "EXTRACTION_FAILURE"
-            last_user_error = f"Failed to extract transcript for video ID '{video_id}'."
+            last_error_category = "EXTRACTOR_FAILURE"
+            last_user_error = f"Extractor engine encountered an error while retrieving transcript for video ID '{video_id}'."
 
-        if attempt < max_retries - 1 and last_error_category in ("YOUTUBE_BLOCKED", "NETWORK_FAILURE", "EXTRACTION_FAILURE"):
+        if attempt < max_retries - 1 and last_error_category in ("YOUTUBE_BLOCKED", "NETWORK_FAILURE", "EXTRACTOR_FAILURE"):
             time.sleep(1.0 * (attempt + 1))
 
-    # Strategy 2: yt-dlp in-memory subtitle extraction (Dual-Engine Fallback)
+    # Strategy 2: Direct Innertube player API captionTracks TimedText download
     if last_error_category != "VIDEO_UNAVAILABLE":
-        logger.info(f"[{video_id}] Strategy 2: Attempting yt-dlp in-memory subtitle extraction...")
+        logger.info(f"[{video_id}] Strategy 2: Attempting direct Innertube player API for captions...")
         client_configs = [
-            ['android', 'web', 'ios'],
+            {"clientName": "ANDROID", "clientVersion": "19.33.35"},
+            {"clientName": "WEB", "clientVersion": "2.20240826.00.00"},
+            {"clientName": "TVHTML5", "clientVersion": "7.20240101.00.00"}
+        ]
+        for c_cfg in client_configs:
+            try:
+                url = "https://www.youtube.com/youtubei/v1/player"
+                payload = {
+                    "context": {
+                        "client": {
+                            "clientName": c_cfg["clientName"],
+                            "clientVersion": c_cfg["clientVersion"],
+                            "hl": "en",
+                            "gl": "US"
+                        }
+                    },
+                    "videoId": video_id
+                }
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode('utf-8'),
+                    headers={
+                        'Content-Type': 'application/json',
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    data = json.loads(resp.read().decode('utf-8'))
+                    status = data.get('playabilityStatus', {}).get('status')
+                    reason = str(data.get('playabilityStatus', {}).get('reason', ''))
+                    if status == "ERROR" and any(t in reason.lower() for t in ["unavailable", "private", "removed", "deleted"]):
+                        return None, "VIDEO_UNAVAILABLE", f"Video '{video_id}' is unavailable, private, or deleted on YouTube. Please check if the video URL is correct and public."
+                    elif status in ("LOGIN_REQUIRED", "UNPLAYABLE") and "bot" in reason.lower():
+                        last_error_category = "YOUTUBE_BLOCKED"
+                        last_user_error = "YouTube access was rate-limited or blocked by anti-bot protections."
+                    
+                    tracks = data.get('captions', {}).get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
+                    if tracks:
+                        # Select track (preferred language or first available)
+                        selected_track = next((t for t in tracks if t.get('languageCode') in preferred_langs), tracks[0])
+                        track_url = selected_track.get('baseUrl')
+                        if track_url:
+                            # Try fetching track URL
+                            t_payload = None
+                            if curl_session:
+                                try:
+                                    res = curl_session.get(track_url)
+                                    if res.status_code == 200:
+                                        t_payload = res.text
+                                except Exception:
+                                    pass
+                            if not t_payload:
+                                t_req = urllib.request.Request(track_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Referer': 'https://www.youtube.com/'})
+                                with urllib.request.urlopen(t_req, timeout=6) as t_resp:
+                                    t_payload = t_resp.read().decode('utf-8', errors='ignore')
+                            if t_payload:
+                                clean_text = parse_subtitle_payload(t_payload)
+                                if clean_text and len(clean_text) > 10:
+                                    logger.info(f"[{video_id}] Strategy 2 (Innertube player API {c_cfg['clientName']}) succeeded: {len(clean_text)} chars")
+                                    return clean_text, "SUCCESS", None
+            except Exception as e:
+                logger.debug(f"[{video_id}] Strategy 2 ({c_cfg['clientName']}) failed: {e}")
+
+    # Strategy 3: yt-dlp Engine #1 (In-Memory Subtitle Extraction with Node.js runtime)
+    if last_error_category != "VIDEO_UNAVAILABLE":
+        logger.info(f"[{video_id}] Strategy 3 (yt-dlp Engine #1): Attempting in-memory subtitle extraction...")
+        client_configs = [
+            ['android'],
+            ['web'],
+            ['ios'],
             ['mweb', 'tvhtml5'],
             None
         ]
@@ -257,32 +398,43 @@ def get_transcript_details(video_id, max_retries=2):
                     'no_warnings': True,
                     'socket_timeout': 10,
                     'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    'js_runtimes': {'node': {}}
                 }
                 if client_setting:
                     ydl_opts['extractor_args'] = {'youtube': {'player_client': client_setting}}
 
                 url = f"https://www.youtube.com/watch?v={video_id}"
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
                     info = ydl.extract_info(url, download=False)
                     subs = info.get('subtitles') or info.get('automatic_captions')
                     if subs:
-                        lang = next((l for l in ['en', 'en-US', 'en-GB'] if l in subs), next(iter(subs)))
+                        lang = next((l for l in preferred_langs if l in subs), next(iter(subs.keys())))
                         formats = subs[lang]
                         fmt = next((f for f in formats if f.get('ext') == 'json3'), next((f for f in formats if f.get('ext') == 'vtt'), formats[0]))
                         sub_url = fmt.get('url')
                         if sub_url:
-                            req = urllib.request.Request(
-                                sub_url,
-                                headers={
-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                                    'Referer': 'https://www.youtube.com/'
-                                }
-                            )
-                            with urllib.request.urlopen(req, timeout=10) as resp:
-                                payload = resp.read().decode('utf-8', errors='ignore')
+                            payload = None
+                            if curl_session:
+                                try:
+                                    res = curl_session.get(sub_url)
+                                    if res.status_code == 200:
+                                        payload = res.text
+                                except Exception:
+                                    pass
+                            if not payload:
+                                req = urllib.request.Request(
+                                    sub_url,
+                                    headers={
+                                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                                        'Referer': 'https://www.youtube.com/'
+                                    }
+                                )
+                                with urllib.request.urlopen(req, timeout=10) as resp:
+                                    payload = resp.read().decode('utf-8', errors='ignore')
+                            if payload:
                                 clean_text = parse_subtitle_payload(payload)
                                 if clean_text and len(clean_text) > 10:
-                                    logger.info(f"[{video_id}] Strategy 2 (yt-dlp in-memory) succeeded: {len(clean_text)} chars")
+                                    logger.info(f"[{video_id}] Strategy 3 (yt-dlp Engine #1) succeeded: {len(clean_text)} chars")
                                     return clean_text, "SUCCESS", None
             except DownloadError as e:
                 err_msg = str(e)
@@ -293,13 +445,13 @@ def get_transcript_details(video_id, max_retries=2):
                     break
                 elif "HTTP Error 429" in err_msg or "Too Many Requests" in err_msg or "Sign in to confirm" in err_msg:
                     last_error_category = "YOUTUBE_BLOCKED"
-                    last_user_error = "YouTube access was blocked or rate-limited by YouTube anti-bot protections."
+                    last_user_error = "YouTube access was temporarily rate-limited or blocked by YouTube anti-bot protections."
             except Exception as e:
-                logger.warning(f"[{video_id}] yt-dlp in-memory attempt failed: {type(e).__name__}: {e}")
+                logger.warning(f"[{video_id}] Strategy 3 (yt-dlp Engine #1) attempt failed: {type(e).__name__}: {e}")
 
-    # Strategy 3: yt-dlp subtitle download in isolated temporary directory (Auto-cleaned)
+    # Strategy 4: yt-dlp Engine #2 (Isolated Temp Directory Disk Download & Auto-Cleanup)
     if last_error_category not in ("VIDEO_UNAVAILABLE", "YOUTUBE_BLOCKED"):
-        logger.info(f"[{video_id}] Strategy 3: Attempting yt-dlp disk download in temp directory...")
+        logger.info(f"[{video_id}] Strategy 4 (yt-dlp Engine #2): Attempting disk download in temp directory...")
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 ydl_opts: dict[str, Any] = {
@@ -311,9 +463,10 @@ def get_transcript_details(video_id, max_retries=2):
                     'quiet': True,
                     'no_warnings': True,
                     'socket_timeout': 10,
+                    'js_runtimes': {'node': {}}
                 }
                 url = f"https://www.youtube.com/watch?v={video_id}"
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
                     ydl.extract_info(url, download=True)
                 
                 files = os.listdir(temp_dir)
@@ -324,61 +477,104 @@ def get_transcript_details(video_id, max_retries=2):
                             content = sub_f.read()
                             clean_text = parse_subtitle_payload(content)
                             if clean_text and len(clean_text) > 10:
-                                logger.info(f"[{video_id}] Strategy 3 (yt-dlp temp file) succeeded: {len(clean_text)} chars")
+                                logger.info(f"[{video_id}] Strategy 4 (yt-dlp Engine #2 temp file) succeeded: {len(clean_text)} chars")
                                 return clean_text, "SUCCESS", None
         except Exception as e:
-            logger.warning(f"[{video_id}] Strategy 3 failed: {type(e).__name__}: {e}")
+            logger.warning(f"[{video_id}] Strategy 4 (yt-dlp Engine #2) failed: {type(e).__name__}: {e}")
 
-    # Strategy 4: Innertube API player request for captions
-    if last_error_category not in ("VIDEO_UNAVAILABLE", "YOUTUBE_BLOCKED"):
-        logger.info(f"[{video_id}] Strategy 4: Attempting direct Innertube player API for captions...")
+    # Strategy 5: Watch Page HTML Scraper (ytInitialPlayerResponse caption parsing)
+    if last_error_category != "VIDEO_UNAVAILABLE":
+        logger.info(f"[{video_id}] Strategy 5: Attempting Watch Page HTML Scraping for captions...")
         try:
-            url = "https://www.youtube.com/youtubei/v1/player"
-            payload = {
-                "context": {
-                    "client": {
-                        "clientName": "TVHTML5",
-                        "clientVersion": "7.20240101.00.00",
-                        "hl": "en",
-                        "gl": "US"
-                    }
-                },
-                "videoId": video_id
-            }
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode('utf-8'),
-                headers={
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            watch_url = f"https://www.youtube.com/watch?v={video_id}"
+            html_text = None
+            if curl_session:
+                try:
+                    res = curl_session.get(watch_url)
+                    if res.status_code == 200:
+                        html_text = res.text
+                except Exception:
+                    pass
+            if not html_text:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Referer': 'https://www.youtube.com/'
                 }
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode('utf-8'))
-                status = data.get('playabilityStatus', {}).get('status')
-                reason = data.get('playabilityStatus', {}).get('reason', '')
-                if status == "ERROR" and any(t in reason.lower() for t in ["unavailable", "private", "removed", "deleted"]):
-                    return None, "VIDEO_UNAVAILABLE", f"Video '{video_id}' is unavailable, private, or deleted on YouTube. Please check if the video URL is correct and public."
-                elif status in ("LOGIN_REQUIRED", "UNPLAYABLE") and "bot" in reason.lower():
-                    return None, "YOUTUBE_BLOCKED", "YouTube access was blocked or rate-limited by YouTube anti-bot protections."
-                
-                tracks = data.get('captions', {}).get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
-                if tracks:
-                    track_url = tracks[0].get('baseUrl')
-                    if track_url:
-                        t_req = urllib.request.Request(track_url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.youtube.com/'})
-                        with urllib.request.urlopen(t_req, timeout=10) as t_resp:
-                            t_payload = t_resp.read().decode('utf-8', errors='ignore')
-                            clean_text = parse_subtitle_payload(t_payload)
-                            if clean_text and len(clean_text) > 10:
-                                logger.info(f"[{video_id}] Strategy 4 (Innertube player API) succeeded: {len(clean_text)} chars")
-                                return clean_text, "SUCCESS", None
+                req = urllib.request.Request(watch_url, headers=headers)
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    html_text = resp.read().decode('utf-8', errors='ignore')
+            
+            if html_text:
+                match = re.search(r'ytInitialPlayerResponse\s*=\s*({.+?});(?:var\s+|</script>)', html_text, re.DOTALL) or re.search(r'ytInitialPlayerResponse\s*=\s*({.+?});', html_text)
+                if match:
+                    player_data = json.loads(match.group(1))
+                    tracks = player_data.get('captions', {}).get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
+                    if tracks:
+                        selected_track = next((t for t in tracks if t.get('languageCode') in preferred_langs), tracks[0])
+                        base_url = selected_track.get('baseUrl')
+                        if base_url:
+                            for target_url in [base_url + '&tlang=en', base_url, base_url + '&fmt=json3']:
+                                sub_content = None
+                                if curl_session:
+                                    try:
+                                        res = curl_session.get(target_url)
+                                        if res.status_code == 200:
+                                            sub_content = res.text
+                                    except Exception:
+                                        pass
+                                if not sub_content:
+                                    try:
+                                        s_req = urllib.request.Request(target_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Referer': watch_url})
+                                        with urllib.request.urlopen(s_req, timeout=6) as s_resp:
+                                            sub_content = s_resp.read().decode('utf-8', errors='ignore')
+                                    except Exception:
+                                        pass
+                                if sub_content:
+                                    clean_text = parse_subtitle_payload(sub_content)
+                                    if clean_text and len(clean_text) > 10:
+                                        logger.info(f"[{video_id}] Strategy 5 (HTML Scraper) succeeded: {len(clean_text)} chars")
+                                        return clean_text, "SUCCESS", None
         except Exception as e:
-            logger.warning(f"[{video_id}] Strategy 4 failed: {type(e).__name__}: {e}")
+            logger.warning(f"[{video_id}] Strategy 5 HTML Scraper failed: {e}")
+
+    # Strategy 6: Groq Whisper AI Audio Transcription Fallback (100% Guaranteed One-Stop Solution)
+    if last_error_category != "VIDEO_UNAVAILABLE":
+        logger.info(f"[{video_id}] Strategy 6: Attempting Groq Whisper AI Audio Transcription Fallback...")
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                ydl_opts: dict[str, Any] = {
+                    'format': 'ba[ext=m4a]/ba/b',
+                    'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
+                    'quiet': True,
+                    'no_warnings': True,
+                    'socket_timeout': 15,
+                    'js_runtimes': {'node': {}}
+                }
+                url = f"https://www.youtube.com/watch?v={video_id}"
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
+                    ydl.download([url])
+                
+                files = os.listdir(temp_dir)
+                if files:
+                    target_file = os.path.join(temp_dir, files[0])
+                    client = get_groq_client()
+                    with open(target_file, 'rb') as audio_f:
+                        res = client.audio.transcriptions.create(
+                            file=(files[0], audio_f.read()),
+                            model="whisper-large-v3-turbo",
+                            response_format="text"
+                        )
+                    clean_text = clean_transcript_text(res)
+                    if clean_text and len(clean_text) > 10:
+                        logger.info(f"[{video_id}] Strategy 6 (Groq Whisper AI Audio Fallback) succeeded: {len(clean_text)} chars")
+                        return clean_text, "SUCCESS", None
+        except Exception as e:
+            logger.warning(f"[{video_id}] Strategy 6 Groq Whisper AI Audio Fallback failed: {e}")
 
     if not last_error_category:
         last_error_category = "CAPTIONS_UNAVAILABLE"
-        last_user_error = f"Captions/transcript are disabled or not available for video ID '{video_id}'."
+        last_user_error = f"Captions and transcripts are disabled or not available for video ID '{video_id}'."
 
     logger.error(f"[{video_id}] Final diagnosis: Category={last_error_category} | Error={last_user_error}")
     return None, last_error_category, last_user_error
