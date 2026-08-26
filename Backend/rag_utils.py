@@ -510,7 +510,7 @@ def get_transcript_details(video_id: str, max_retries: int = 2) -> tuple[str | N
                 logger.warning(f"[{video_id}] Strategy 3 (yt-dlp Engine #1) attempt failed: {type(e).__name__}: {e}")
 
     # Strategy 4: yt-dlp Engine #2 (Isolated Temp Directory Disk Download & Auto-Cleanup)
-    if last_error_category not in ("VIDEO_UNAVAILABLE", "YOUTUBE_BLOCKED"):
+    if last_error_category != "VIDEO_UNAVAILABLE":
         logger.info(f"[{video_id}] Strategy 4 (yt-dlp Engine #2): Attempting disk download in temp directory...")
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -603,38 +603,50 @@ def get_transcript_details(video_id: str, max_retries: int = 2) -> tuple[str | N
     # Strategy 6: Groq Whisper AI Audio Transcription Fallback (100% Guaranteed One-Stop Solution)
     if last_error_category != "VIDEO_UNAVAILABLE":
         logger.info(f"[{video_id}] Strategy 6: Attempting Groq Whisper AI Audio Transcription Fallback...")
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                ydl_opts: dict[str, Any] = {
-                    'format': 'ba[ext=m4a]/ba/b',
-                    'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
-                    'quiet': True,
-                    'no_warnings': True,
-                    'socket_timeout': 15,
-                    'js_runtimes': {'node': {}}
-                }
-                if cookie_path:
-                    ydl_opts['cookiefile'] = cookie_path
-                url = f"https://www.youtube.com/watch?v={video_id}"
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
-                    ydl.download([url])
-                
-                files = os.listdir(temp_dir)
-                if files:
-                    target_file = os.path.join(temp_dir, files[0])
-                    client = get_groq_client()
-                    with open(target_file, 'rb') as audio_f:
-                        res = client.audio.transcriptions.create(
-                            file=(files[0], audio_f.read()),
-                            model="whisper-large-v3-turbo",
-                            response_format="text"
-                        )
-                    clean_text = clean_transcript_text(res)
-                    if clean_text and len(clean_text) > 10:
-                        logger.info(f"[{video_id}] Strategy 6 (Groq Whisper AI Audio Fallback) succeeded: {len(clean_text)} chars")
-                        return clean_text, "SUCCESS", None
-        except Exception as e:
-            logger.warning(f"[{video_id}] Strategy 6 Groq Whisper AI Audio Fallback failed: {e}")
+        client_configs = [
+            ['android'],
+            ['ios'],
+            ['web'],
+            ['mweb', 'tvhtml5'],
+            None
+        ]
+        for client_setting in client_configs:
+            try:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    ydl_opts: dict[str, Any] = {
+                        'format': 'ba[ext=m4a]/ba/b/bestaudio/best',
+                        'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
+                        'quiet': True,
+                        'no_warnings': True,
+                        'socket_timeout': 15,
+                        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                        'js_runtimes': {'node': {}}
+                    }
+                    if cookie_path:
+                        ydl_opts['cookiefile'] = cookie_path
+                    if client_setting:
+                        ydl_opts['extractor_args'] = {'youtube': {'player_client': client_setting}}
+
+                    url = f"https://www.youtube.com/watch?v={video_id}"
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
+                        ydl.download([url])
+                    
+                    files = os.listdir(temp_dir)
+                    if files:
+                        target_file = os.path.join(temp_dir, files[0])
+                        client = get_groq_client()
+                        with open(target_file, 'rb') as audio_f:
+                            res = client.audio.transcriptions.create(
+                                file=(files[0], audio_f.read()),
+                                model="whisper-large-v3-turbo",
+                                response_format="text"
+                            )
+                        clean_text = clean_transcript_text(res)
+                        if clean_text and len(clean_text) > 10:
+                            logger.info(f"[{video_id}] Strategy 6 (Groq Whisper AI Audio Fallback {client_setting}) succeeded: {len(clean_text)} chars")
+                            return clean_text, "SUCCESS", None
+            except Exception as e:
+                logger.debug(f"[{video_id}] Strategy 6 audio attempt ({client_setting}) failed: {e}")
 
     if not last_error_category:
         last_error_category = "CAPTIONS_UNAVAILABLE"
