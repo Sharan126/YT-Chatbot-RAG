@@ -60,16 +60,16 @@ async def process_video(request: Request, url: Optional[str] = None):
             pass
 
     if not url:
-        return {"error": "Missing video URL"}
+        return {"error": "Missing video URL. Please provide a valid YouTube video URL or ID."}
 
     video_id = extract_video_id(url)
     if not video_id:
-        return {"error": "invalid url"}
+        return {"error": "Invalid YouTube URL or video ID format. Supported formats include youtu.be/ID, youtube.com/watch?v=ID, and youtube.com/shorts/ID."}
 
-    # Get Transcript
-    text = get_transcript(video_id)
+    # Get Transcript with categorized failure diagnosis
+    text, category, err_msg = get_transcript_details(video_id)
     if text is None:
-        return {"error": f"Transcript not available for video ID '{video_id}'. Please check if the video URL/ID is correct, public, and has captions enabled."}
+        return {"error": err_msg or f"Unable to extract transcript for video ID '{video_id}'.", "category": category}
 
     try:
         # Split Transcript into chunks
