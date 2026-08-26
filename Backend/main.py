@@ -1,5 +1,11 @@
 # this file will runs the FastAPI Backend
 import sys
+import os
+
+# Ensure Backend directory is in sys.path for robust module resolution
+backend_dir = os.path.dirname(os.path.abspath(__file__))
+if backend_dir not in sys.path:
+    sys.path.insert(0, backend_dir)
 
 # Ensure stdout and stderr handle UTF-8 characters on Windows console
 if hasattr(sys.stdout, "reconfigure"):
@@ -33,11 +39,12 @@ index = None
 from typing import Optional
 from fastapi import Request
 
-# Health check endpoints
-@app.get("/health")
-@app.get("/api/health")
+# Health check endpoints (GET and HEAD supported for Render health check probes)
+@app.api_route("/health", methods=["GET", "HEAD"])
+@app.api_route("/api/health", methods=["GET", "HEAD"])
 def health():
-    return {"status": "ok", "message": "FastAPI YTCheck backend running on port 8000"}
+    port = os.getenv("PORT", "10000")
+    return {"status": "ok", "message": f"FastAPI YTCheck backend running on port {port}"}
 
 # 1. Video Process EndPoint
 @app.post("/process_video")
@@ -152,6 +159,12 @@ if os.path.exists(frontend_dist):
         if full_path and os.path.exists(target_file) and os.path.isfile(target_file):
             return FileResponse(target_file)
         return FileResponse(os.path.join(frontend_dist, "index.html"))
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+
 
 
 

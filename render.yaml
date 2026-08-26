@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: yt-chatbot-rag
+    env: docker
+    plan: free
+    dockerfilePath: Dockerfile
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: GROQ_API_KEY
+        sync: false
