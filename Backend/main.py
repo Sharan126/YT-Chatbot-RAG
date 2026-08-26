@@ -30,10 +30,30 @@ app.add_middleware(
 chunks = []
 index = None
 
+from typing import Optional
+from fastapi import Request
+
+# Health check endpoints
+@app.get("/health")
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "message": "FastAPI YTCheck backend running on port 8000"}
+
 # 1. Video Process EndPoint
 @app.post("/process_video")
-def process_video(url: str):
+async def process_video(request: Request, url: Optional[str] = None):
     global chunks, index
+
+    if not url:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                url = body.get("url")
+        except Exception:
+            pass
+
+    if not url:
+        return {"error": "Missing video URL"}
 
     video_id = extract_video_id(url)
     if not video_id:
@@ -54,7 +74,7 @@ def process_video(url: str):
         # Build Faiss index
         index = build_faiss_index(embeddings)
 
-        return {"message": "Video processed successfully"}
+        return {"message": "Video processed successfully", "video_id": video_id, "chunk_count": len(chunks)}
     except Exception as e:
         import traceback
         print("Process video error:", e)
@@ -62,7 +82,20 @@ def process_video(url: str):
 
 # 2. Question Endpoint
 @app.post("/ask")
-def ask(question: str):
+async def ask(request: Request, question: Optional[str] = None):
+    global chunks, index
+
+    if not question:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                question = body.get("question")
+        except Exception:
+            pass
+
+    if not question:
+        return {"error": "Missing question parameter"}
+
     if index is None:
         return {"error": "Please Process a video first"}
 
@@ -84,7 +117,7 @@ def ask(question: str):
             
         context = " ".join(context_chunks)
 
-        print("Retrived chunks", top_chunks)
+        print("Retrieved chunks", top_chunks)
         try:
             print("Context preview", context[:300])
         except Exception:

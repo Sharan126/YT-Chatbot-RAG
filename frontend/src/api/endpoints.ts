@@ -69,7 +69,7 @@ export async function askQuestion(question: string): Promise<AskQuestionResponse
 export async function checkBackendHealth(): Promise<BackendHealthStatus> {
   const startTime = performance.now();
   try {
-    await apiClient.options('/ask', { timeout: 4000 });
+    await apiClient.get('/health', { timeout: 4000 });
     const latencyMs = Math.round(performance.now() - startTime);
     return {
       online: true,
@@ -78,7 +78,7 @@ export async function checkBackendHealth(): Promise<BackendHealthStatus> {
     };
   } catch {
     try {
-      await apiClient.post('/ask', null, { params: { question: '' }, timeout: 4000 });
+      await apiClient.options('/ask', { timeout: 4000 });
       const latencyMs = Math.round(performance.now() - startTime);
       return {
         online: true,
