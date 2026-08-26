@@ -62,7 +62,7 @@ async def process_video(request: Request, url: Optional[str] = None):
     # Get Transcript
     text = get_transcript(video_id)
     if text is None:
-        return {"error": "transcript not available for this video"}
+        return {"error": f"Transcript not available for video ID '{video_id}'. Please check if the video URL/ID is correct, public, and has captions enabled."}
 
     try:
         # Split Transcript into chunks
